@@ -1,4 +1,3 @@
-
 const POOLS = {
   service: [
     { id: "svc1", url: "https://1serviceddma.sergiirudniev.com" },
@@ -20,7 +19,17 @@ function ipHashPick(pool, ip) {
 
 export default {
   async fetch(req, env) {
-    const host = req.headers.get("host") || "";
+    const urlIn = new URL(req.url);
+    const host = req.headers.get("host") || urlIn.host;
+
+    if (urlIn.pathname === "/__lb/health") {
+      const svc = JSON.parse((await env.KV.get("health:service")) || "{}");
+      const adm = JSON.parse((await env.KV.get("health:admin")) || "{}");
+      return new Response(JSON.stringify({ host, svc, adm }), {
+        status: 200, headers: { "content-type": "application/json" }
+      });
+    }
+
     const isService = host.startsWith("algopraktrob.");
     const isAdmin   = host.startsWith("algopraktrobadmin.");
     if (!isService && !isAdmin) return new Response("Not routed", { status: 404 });
@@ -28,15 +37,15 @@ export default {
     const poolName  = isService ? "service" : "admin";
     const cookieKey = isService ? "lb_svc"  : "lb_adm";
     const backends  = POOLS[poolName];
-    
+
     const kvKey  = `health:${poolName}`;
     const health = JSON.parse((await env.KV.get(kvKey)) || "{}");
     let healthyPool = backends.filter(b => health[b.id] !== false);
     if (!healthyPool.length) healthyPool = backends;
 
     const cookie = req.headers.get("cookie") || "";
-    const m = new RegExp(`${cookieKey}=([^;]+)`).exec(cookie);
-    let target = m ? healthyPool.find(b => b.id === m[1]) : null;
+    const sticky = new RegExp(`${cookieKey}=([^;]+)`).exec(cookie)?.[1];
+    let target = sticky ? healthyPool.find(b => b.id === sticky) : null;
 
     if (!target) {
       const ip = req.headers.get("cf-connecting-ip") || "";
@@ -50,21 +59,21 @@ export default {
     url.port     = upstream.port;
 
     const ac = new AbortController();
-    const t = setTimeout(() => ac.abort("upstream timeout"), 10_000);
+    const timeout = setTimeout(() => ac.abort("upstream timeout"), 10_000);
 
     let resp;
     try {
       const init = new Request(url.toString(), req);
       resp = await fetch(init, { cf: { cacheTtl: 0, cacheEverything: false }, signal: ac.signal });
     } catch {
-      clearTimeout(t);
+      clearTimeout(timeout);
       const fallback = healthyPool.find(b => b.id !== target.id);
       if (!fallback) return new Response("Upstream unavailable", { status: 502 });
       const fUrl = new URL(req.url); const fUp = new URL(fallback.url);
       fUrl.protocol = fUp.protocol; fUrl.hostname = fUp.hostname; fUrl.port = fUp.port;
       resp = await fetch(new Request(fUrl.toString(), req), { cf: { cacheTtl: 0, cacheEverything: false } });
     } finally {
-      clearTimeout(t);
+      clearTimeout(timeout);
     }
 
     const ttl = Number(env.COOKIE_TTL_SECONDS || "600");
@@ -75,18 +84,28 @@ export default {
   },
 
   async scheduled(_event, env) {
-    for (const poolName of ["service", "admin"]) {
-      const list = POOLS[poolName];
+    const pools = [
+      { name: "service", list: POOLS.service, path: env.HEALTH_PATH_SERVICE || "/" },
+      { name: "admin",   list: POOLS.admin,   path: env.HEALTH_PATH_ADMIN   || "/admin" },
+    ];
+
+    for (const { name, list, path } of pools) {
       const results = {};
       await Promise.all(list.map(async (b) => {
         try {
-          const r = await fetch(b.url, { method: "GET" });
-          results[b.id] = r.ok;
+          const u = new URL(b.url);
+          u.pathname = path;
+          const r = await fetch(u.toString(), {
+            method: "GET",
+            redirect: "follow",
+            headers: { "User-Agent": "EdgeLB/1.0", "Accept": "*/*" },
+          });
+          results[b.id] = r.status < 400;
         } catch {
           results[b.id] = false;
         }
       }));
-      await env.KV.put(`health:${poolName}`, JSON.stringify(results));
+      await env.KV.put(`health:${name}`, JSON.stringify(results));
     }
   }
 };
