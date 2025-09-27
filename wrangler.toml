@@ -18,3 +18,6 @@ crons = ["* * * * *"]
 COOKIE_TTL_SECONDS = "600"
 HEALTH_PATH_SERVICE = "/"
 HEALTH_PATH_ADMIN = "/admin"
+
+[observability.logs]
+enabled = true
