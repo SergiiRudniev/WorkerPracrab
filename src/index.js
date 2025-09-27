@@ -9,6 +9,10 @@ const POOLS = {
   ],
 };
 
+function ema(prev, cur, alpha = 0.3) {
+  return prev == null ? cur : prev * (1 - alpha) + cur * alpha;
+}
+
 function ipHashPick(pool, ip) {
   if (!pool.length) return null;
   if (!ip) return pool[Math.floor(Math.random() * pool.length)];
@@ -17,15 +21,85 @@ function ipHashPick(pool, ip) {
   return pool[h % pool.length];
 }
 
+async function chooseTarget(req, env, poolName, healthyPool, cookieKey) {
+  const cookie = req.headers.get("cookie") || "";
+  const stickyId = new RegExp(`${cookieKey}=([^;]+)`).exec(cookie)?.[1];
+  const stickyTarget = stickyId ? healthyPool.find(b => b.id === stickyId) : null;
+  if (stickyTarget) return stickyTarget;
+
+  const colo = (req.cf && req.cf.colo) || "ZZZ";
+  const rttKey = `rtt:${poolName}:${colo}`;
+  const rttMap = JSON.parse((await env.KV.get(rttKey)) || "{}");
+  if (Object.keys(rttMap).length) {
+    const sorted = healthyPool.slice().sort((a, b) => (rttMap[a.id] ?? 1e9) - (rttMap[b.id] ?? 1e9));
+    return sorted[0] || healthyPool[0];
+  }
+
+  const ip = req.headers.get("cf-connecting-ip") || "";
+  return ipHashPick(healthyPool, ip) || healthyPool[0];
+}
+
+function buildUpstreamRequest(req, targetUrl) {
+  const url = new URL(req.url);
+  const upstream = new URL(targetUrl);
+  url.protocol = upstream.protocol;
+  url.hostname = upstream.hostname;
+  url.port = upstream.port;
+
+  const headers = new Headers(req.headers);
+  headers.set("X-Forwarded-Proto", req.headers.get("X-Forwarded-Proto") || (req.url.startsWith("https:") ? "https" : "http"));
+  headers.set("X-Forwarded-Host", req.headers.get("host") || "");
+  headers.set("X-Real-IP", req.headers.get("cf-connecting-ip") || "");
+
+  const init = {
+    method: req.method,
+    headers,
+    body: req.body,     
+    redirect: "manual",
+    cf: { cacheTtl: 0, cacheEverything: false },
+  };
+  return new Request(url.toString(), init);
+}
+
+async function proxyOnce(req, env, poolName, target, measureRtt = true) {
+  const colo = (req.cf && req.cf.colo) || "ZZZ";
+  const rttKey = `rtt:${poolName}:${colo}`;
+
+  const initReq = buildUpstreamRequest(req, target.url);
+
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort("upstream timeout"), 10_000);
+
+  let resp, dt = null;
+  const t0 = measureRtt ? Date.now() : null;
+
+  try {
+    resp = await fetch(initReq, { signal: ac.signal });
+  } finally {
+    clearTimeout(timer);
+    if (measureRtt) {
+      dt = Date.now() - t0;
+      const rttMap = JSON.parse((await env.KV.get(rttKey)) || "{}");
+      rttMap[target.id] = ema(rttMap[target.id], dt);
+      await env.KV.put(rttKey, JSON.stringify(rttMap), { expirationTtl: 3600 });
+    }
+  }
+
+  return resp;
+}
+
 export default {
   async fetch(req, env) {
     const urlIn = new URL(req.url);
     const host = req.headers.get("host") || urlIn.host;
 
     if (urlIn.pathname === "/__lb/health") {
+      const colo = (req.cf && req.cf.colo) || "ZZZ";
       const svc = JSON.parse((await env.KV.get("health:service")) || "{}");
       const adm = JSON.parse((await env.KV.get("health:admin")) || "{}");
-      return new Response(JSON.stringify({ host, svc, adm }), {
+      const rttSvc = JSON.parse((await env.KV.get(`rtt:service:${colo}`)) || "{}");
+      const rttAdm = JSON.parse((await env.KV.get(`rtt:admin:${colo}`)) || "{}");
+      return new Response(JSON.stringify({ host, colo, svc, adm, rttSvc, rttAdm }), {
         status: 200, headers: { "content-type": "application/json" }
       });
     }
@@ -38,46 +112,31 @@ export default {
     const cookieKey = isService ? "lb_svc"  : "lb_adm";
     const backends  = POOLS[poolName];
 
-    const kvKey  = `health:${poolName}`;
-    const health = JSON.parse((await env.KV.get(kvKey)) || "{}");
+    
+    const health = JSON.parse((await env.KV.get(`health:${poolName}`)) || "{}");
     let healthyPool = backends.filter(b => health[b.id] !== false);
     if (!healthyPool.length) healthyPool = backends;
 
-    const cookie = req.headers.get("cookie") || "";
-    const sticky = new RegExp(`${cookieKey}=([^;]+)`).exec(cookie)?.[1];
-    let target = sticky ? healthyPool.find(b => b.id === sticky) : null;
+    let target = await chooseTarget(req, env, poolName, healthyPool, cookieKey);
 
-    if (!target) {
-      const ip = req.headers.get("cf-connecting-ip") || "";
-      target = ipHashPick(healthyPool, ip);
+    let resp = await proxyOnce(req, env, poolName, target, true);
+    if (!resp || resp.status >= 502 || resp.status === 0) {
+      const colo = (req.cf && req.cf.colo) || "ZZZ";
+      const rttMap = JSON.parse((await env.KV.get(`rtt:${poolName}:${colo}`)) || "{}");
+      const ordered = healthyPool
+        .slice()
+        .sort((a, b) => (rttMap[a.id] ?? 1e9) - (rttMap[b.id] ?? 1e9))
+        .filter(b => b.id !== target.id);
+      const fallback = ordered[0];
+      if (fallback) {
+        resp = await proxyOnce(req, env, poolName, fallback, true);
+        if (resp) target = fallback;
+      }
     }
-
-    const upstream = new URL(target.url);
-    const url = new URL(req.url);
-    url.protocol = upstream.protocol;
-    url.hostname = upstream.hostname;
-    url.port     = upstream.port;
-
-    const ac = new AbortController();
-    const timeout = setTimeout(() => ac.abort("upstream timeout"), 10_000);
-
-    let resp;
-    try {
-      const init = new Request(url.toString(), req);
-      resp = await fetch(init, { cf: { cacheTtl: 0, cacheEverything: false }, signal: ac.signal });
-    } catch {
-      clearTimeout(timeout);
-      const fallback = healthyPool.find(b => b.id !== target.id);
-      if (!fallback) return new Response("Upstream unavailable", { status: 502 });
-      const fUrl = new URL(req.url); const fUp = new URL(fallback.url);
-      fUrl.protocol = fUp.protocol; fUrl.hostname = fUp.hostname; fUrl.port = fUp.port;
-      resp = await fetch(new Request(fUrl.toString(), req), { cf: { cacheTtl: 0, cacheEverything: false } });
-    } finally {
-      clearTimeout(timeout);
-    }
+    if (!resp) return new Response("Upstream unavailable", { status: 502 });
 
     const ttl = Number(env.COOKIE_TTL_SECONDS || "600");
-    const out = new Response(resp.body, resp);
+    const out = new Response(resp.body, resp); 
     out.headers.append("Set-Cookie", `${cookieKey}=${target.id}; Path=/; Max-Age=${ttl}; SameSite=Lax`);
     out.headers.set("x-lb-backend", target.id);
     return out;
@@ -85,8 +144,8 @@ export default {
 
   async scheduled(_event, env) {
     const pools = [
-      { name: "service", list: POOLS.service, path: env.HEALTH_PATH_SERVICE || "/" },
-      { name: "admin",   list: POOLS.admin,   path: env.HEALTH_PATH_ADMIN   || "/admin" },
+      { name: "service", list: POOLS.service, path: "/" },
+      { name: "admin",   list: POOLS.admin,   path: "/admin" },
     ];
 
     for (const { name, list, path } of pools) {
