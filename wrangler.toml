@@ -1,4 +1,4 @@
-name = "sergii-edge-lb"
+name = "loadbalancer"
 main = "src/index.js"
 compatibility_date = "2024-11-01"
 
