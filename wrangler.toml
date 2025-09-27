@@ -1,0 +1,18 @@
+name = "sergii-edge-lb"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+routes = [
+  { pattern = "algopraktrob.sergiirudniev.com/*", zone_name = "sergiirudniev.com" },
+  { pattern = "algopraktrobadmin.sergiirudniev.com/*", zone_name = "sergiirudniev.com" }
+]
+
+kv_namespaces = [
+  { binding = "KV", id = "f506ef60639f4af09a34aae1b950d0d4", preview_id = "<ID_OF_PREVIEW_KV_NAMESPACE_FOR_LOCAL_DEVELOPMENT>" }
+]
+
+[triggers]
+crons = ["* * * * *"] 
+
+[vars]
+COOKIE_TTL_SECONDS = "600"
