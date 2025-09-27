@@ -5,7 +5,7 @@ const POOLS = {
   ],
   admin: [
     { id: "adm1", url: "https://1adminddma.sergiirudniev.com" },
-    { id: "adm2", url: "https://2adminddma.sergiirudniev.com" },
+    { id: "adm2", url: "https://2adminddma.sergiirudnieв.com" },
   ],
 };
 
@@ -22,10 +22,13 @@ function ipHashPick(pool, ip) {
 }
 
 async function chooseTarget(req, env, poolName, healthyPool, cookieKey) {
-  const cookie = req.headers.get("cookie") || "";
-  const stickyId = new RegExp(`${cookieKey}=([^;]+)`).exec(cookie)?.[1];
-  const stickyTarget = stickyId ? healthyPool.find(b => b.id === stickyId) : null;
-  if (stickyTarget) return stickyTarget;
+  const stickyEnabled = (env.STICKY_ENABLED || "1") === "1";
+  if (stickyEnabled) {
+    const cookie = req.headers.get("cookie") || "";
+    const stickyId = new RegExp(`${cookieKey}=([^;]+)`).exec(cookie)?.[1];
+    const stickyTarget = stickyId ? healthyPool.find(b => b.id === stickyId) : null;
+    if (stickyTarget) return stickyTarget;
+  }
 
   const colo = (req.cf && req.cf.colo) || "ZZZ";
   const rttKey = `rtt:${poolName}:${colo}`;
@@ -39,12 +42,19 @@ async function chooseTarget(req, env, poolName, healthyPool, cookieKey) {
   return ipHashPick(healthyPool, ip) || healthyPool[0];
 }
 
-function buildUpstreamRequest(req, targetUrl) {
+async function readBodyOnce(req) {
+  const m = req.method.toUpperCase();
+  if (m === "GET" || m === "HEAD") return null;
+  const ab = await req.arrayBuffer();
+  return ab;
+}
+
+function buildUpstreamRequestFromBuffer(req, targetUrl, bodyBuf) {
   const url = new URL(req.url);
   const upstream = new URL(targetUrl);
   url.protocol = upstream.protocol;
   url.hostname = upstream.hostname;
-  url.port = upstream.port;
+  url.port     = upstream.port;
 
   const headers = new Headers(req.headers);
   headers.set("X-Forwarded-Proto", req.headers.get("X-Forwarded-Proto") || (req.url.startsWith("https:") ? "https" : "http"));
@@ -54,18 +64,18 @@ function buildUpstreamRequest(req, targetUrl) {
   const init = {
     method: req.method,
     headers,
-    body: req.body,     
+    body: bodyBuf ? bodyBuf.slice(0) : null,
     redirect: "manual",
     cf: { cacheTtl: 0, cacheEverything: false },
   };
   return new Request(url.toString(), init);
 }
 
-async function proxyOnce(req, env, poolName, target, measureRtt = true) {
+async function proxyOnce(req, env, poolName, target, bodyBuf, measureRtt = true) {
   const colo = (req.cf && req.cf.colo) || "ZZZ";
   const rttKey = `rtt:${poolName}:${colo}`;
 
-  const initReq = buildUpstreamRequest(req, target.url);
+  const initReq = buildUpstreamRequestFromBuffer(req, target.url, bodyBuf);
 
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort("upstream timeout"), 10_000);
@@ -84,7 +94,6 @@ async function proxyOnce(req, env, poolName, target, measureRtt = true) {
       await env.KV.put(rttKey, JSON.stringify(rttMap), { expirationTtl: 3600 });
     }
   }
-
   return resp;
 }
 
@@ -112,14 +121,16 @@ export default {
     const cookieKey = isService ? "lb_svc"  : "lb_adm";
     const backends  = POOLS[poolName];
 
-    
     const health = JSON.parse((await env.KV.get(`health:${poolName}`)) || "{}");
     let healthyPool = backends.filter(b => health[b.id] !== false);
     if (!healthyPool.length) healthyPool = backends;
 
     let target = await chooseTarget(req, env, poolName, healthyPool, cookieKey);
 
-    let resp = await proxyOnce(req, env, poolName, target, true);
+    const bodyBuf = await readBodyOnce(req);
+
+    let resp = await proxyOnce(req, env, poolName, target, bodyBuf, true);
+
     if (!resp || resp.status >= 502 || resp.status === 0) {
       const colo = (req.cf && req.cf.colo) || "ZZZ";
       const rttMap = JSON.parse((await env.KV.get(`rtt:${poolName}:${colo}`)) || "{}");
@@ -129,16 +140,19 @@ export default {
         .filter(b => b.id !== target.id);
       const fallback = ordered[0];
       if (fallback) {
-        resp = await proxyOnce(req, env, poolName, fallback, true);
+        resp = await proxyOnce(req, env, poolName, fallback, bodyBuf, true);
         if (resp) target = fallback;
       }
     }
     if (!resp) return new Response("Upstream unavailable", { status: 502 });
 
-    const ttl = Number(env.COOKIE_TTL_SECONDS || "600");
     const out = new Response(resp.body, resp); 
-    out.headers.append("Set-Cookie", `${cookieKey}=${target.id}; Path=/; Max-Age=${ttl}; SameSite=Lax`);
     out.headers.set("x-lb-backend", target.id);
+
+    if ((env.STICKY_ENABLED || "1") === "1") {
+      const ttl = Number(env.COOKIE_TTL_SECONDS || "600");
+      out.headers.append("Set-Cookie", `${cookieKey}=${target.id}; Path=/; Max-Age=${ttl}; SameSite=Lax`);
+    }
     return out;
   },
 
